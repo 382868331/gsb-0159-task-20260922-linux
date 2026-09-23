@@ -19,7 +19,7 @@ from __future__ import annotations
 import time
 
 from minparen import (
-    ASTError, ParseError, parse, print_ast,
+    ASTError, ParseError, PathError, parse, print_ast, replace_subtree,
 )
 from minparen.ast_nodes import binop, call, cond, neg, num, var
 from reference import refenum
@@ -151,6 +151,66 @@ def main() -> None:
         refenum.best_wrapping(sample_tree, accept=lambda s: "ZZZ" in s)
     except NoSolutionError as exc:
         print(f"- NoSolutionError (proved impossible): {exc}")
+
+    print()
+    print("=== 4. Subtree replacement as a single edit span (UTF-8 bytes) ===")
+
+    def swap(title, source, path, replacement):
+        edit = replace_subtree(source, path, replacement)
+        applied = edit.apply(source)
+        # Real check: the edited text parses to the original tree with the
+        # subtree swapped, and everything outside the span is byte-identical.
+        original, edited = source.encode("utf-8"), applied.encode("utf-8")
+        assert edited[:edit.start] == original[:edit.start]
+        assert edited[len(edited) - (len(original) - edit.end):] == \
+            original[edit.end:]
+        print(f"- {title}")
+        print(f"    source : {source}")
+        print(f"    edit   : bytes [{edit.start}, {edit.end}) "
+              f"-> {edit.replacement!r}")
+        print(f"    result : {applied}")
+        return applied
+
+    # 4a. Boundary parens added by precedence: right of '-' is strict.
+    out = swap("replace b-c with x+y (parens required)",
+               "a-(b-c)", "root.right", binop("+", var("x"), var("y")))
+    assert out == "a-(x+y)"
+    assert parse(out) == parse("a-(x+y)")
+
+    # 4b. Nested redundant parens leave with the replaced subtree.
+    out = swap("replace b+c inside doubled parens",
+               "a*((b+c))", "root.right", binop("-", var("x"), var("y")))
+    assert out == "a*(x-y)"
+
+    # 4c. Untouched whitespace, a multibyte comment on the left sibling and
+    # the line-end comment stay byte-for-byte; spans are UTF-8 byte offsets.
+    source = "a /*保留*/ +  b /*tail*/"
+    out = swap("replace b; multibyte + trailing comments untouched",
+               source, "root.right", num(3))
+    assert out == "a /*保留*/ +  3 /*tail*/"
+
+    # 4d. A comment owned by the replaced node leaves with it.
+    out = swap("replace the node owning /*gone*/",
+               "a+/*gone*/b", "root.right", var("x"))
+    assert out == "a+x"
+
+    print()
+    print("=== 5. Replacement-time rejection that actually fires ===")
+    # 5a. A path that does not resolve against the parsed tree.
+    try:
+        replace_subtree("a+b", "root.left.right", var("x"))
+    except PathError as exc:
+        print(f"- PathError caught (as designed): {exc}")
+    else:  # pragma: no cover
+        raise SystemExit("expected PathError was not raised")
+
+    # 5b. An invalid replacement AST; nothing is applied or half-updated.
+    try:
+        replace_subtree("a+b", "root.right", {"kind": "num", "value": -1})
+    except ASTError as exc:
+        print(f"- ASTError caught (as designed): {exc}")
+    else:  # pragma: no cover
+        raise SystemExit("expected ASTError was not raised")
 
     print()
     print(f"All checks performed in {time.perf_counter() - t0:.2f}s.")

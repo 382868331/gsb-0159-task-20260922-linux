@@ -60,6 +60,13 @@ def _err(src: str, offset: int, message: str) -> ParseError:
     return ParseError(message, offset, line, col)
 
 
+def _tok_end(tok: _Tok) -> int:
+    """Source offset just past ``tok`` (comments include both delimiters)."""
+    if tok.kind == T_COMMENT:
+        return tok.start + len(tok.value) + 4
+    return tok.start + len(tok.value)
+
+
 def _tokenize(src: str) -> list[_Tok]:
     tokens: list[_Tok] = []
     i, n = 0, len(src)
@@ -118,6 +125,11 @@ class _Parser:
         self.pos = 0  # global index into self.tokens
         # (prev non-comment index, next non-comment index) -> (node, side)
         self.gaps: dict[tuple[int, int], tuple[dict, str]] = {}
+        # Optional source tracking, keyed by id() of the raw (pre-validation)
+        # node: token-index span of each node, and char spans of the comment
+        # tokens attached to it. Recorded unconditionally; it is cheap.
+        self.token_spans: dict[int, tuple[int, int]] = {}
+        self.comment_spans: dict[int, list[tuple[int, int]]] = {}
 
     # -- token stream ------------------------------------------------------
 
@@ -153,9 +165,14 @@ class _Parser:
     def _claim(self, prev: int, nxt: int, node: dict, side: str) -> None:
         self.gaps[(prev, nxt)] = (node, side)
 
+    def _record(self, node: dict, first: int, last: int) -> None:
+        # Every grammar level re-records the node it passes upward; the
+        # outermost (widest) span is recorded last and wins.
+        self.token_spans[id(node)] = (first, last)
+
     # -- grammar: each method returns (node, first_idx, last_idx) ----------
 
-    def parse(self) -> dict:
+    def parse(self, *, with_spans: bool = False):
         root, _, _ = self._assign()
         leftover = self._peek()
         if leftover is not None:
@@ -174,7 +191,47 @@ class _Parser:
         self._attach_comments()
         # Strict structural validation of the finished tree (raises ASTError
         # only if the parser itself built something off-contract).
-        return validate_tree(root, max_nodes=self.max_nodes)
+        validated = validate_tree(root, max_nodes=self.max_nodes)
+        if with_spans:
+            return validated, self._span_map(root, validated)
+        return validated
+
+    def _span_map(self, raw_root: dict,
+                  validated_root: dict) -> dict[int, tuple[int, int]]:
+        """Map id(validated node) -> (char_start, char_end) in the source.
+
+        The span covers the node's own tokens (including any grouping
+        parentheses the parser attributed to it) plus the node's own
+        lead/trail comment tokens; whitespace and comments owned by other
+        nodes stay outside.
+        """
+        spans: dict[int, tuple[int, int]] = {}
+
+        def walk(raw: dict, val: dict) -> None:
+            first, last = self.token_spans[id(raw)]
+            start = self.tokens[first].start
+            end = _tok_end(self.tokens[last])
+            for cs, ce in self.comment_spans.get(id(raw), ()):
+                start = min(start, cs)
+                end = max(end, ce)
+            spans[id(val)] = (start, end)
+            kind = raw["kind"]
+            if kind == "neg":
+                walk(raw["operand"], val["operand"])
+            elif kind == "bin":
+                walk(raw["left"], val["left"])
+                walk(raw["right"], val["right"])
+            elif kind == "cond":
+                walk(raw["cond"], val["cond"])
+                walk(raw["then"], val["then"])
+                walk(raw["else"], val["else"])
+            elif kind == "call":
+                walk(raw["callee"], val["callee"])
+                for raw_arg, val_arg in zip(raw["args"], val["args"]):
+                    walk(raw_arg, val_arg)
+
+        walk(raw_root, validated_root)
+        return spans
 
     def _assign(self) -> tuple[dict, int, int]:
         left, lf, ll = self._cond()
@@ -187,13 +244,16 @@ class _Parser:
             self._claim(oi, rf, right, "lead")
             node = {"kind": "bin", "op": "=", "left": left, "right": right}
             self._count(tok)
+            self._record(node, lf, rl)
             return node, lf, rl
+        self._record(left, lf, ll)
         return left, lf, ll
 
     def _cond(self) -> tuple[dict, int, int]:
         test, tf, tl = self._add()
         tok = self._peek()
         if tok is None or tok.kind != T_PUNCT or tok.value != "?":
+            self._record(test, tf, tl)
             return test, tf, tl
         qi = self.pos
         self._take("?")
@@ -213,6 +273,7 @@ class _Parser:
         node = {"kind": "cond", "cond": test, "then": then,
                 "else": else_node}
         self._count(tok)
+        self._record(node, tf, el)
         return node, tf, el
 
     def _add(self) -> tuple[dict, int, int]:
@@ -226,6 +287,7 @@ class _Parser:
         while True:
             tok = self._peek()
             if tok is None or tok.kind != T_PUNCT or tok.value not in ops:
+                self._record(left, lf, ll)
                 return left, lf, ll
             oi = self.pos
             self._take()
@@ -237,6 +299,9 @@ class _Parser:
                     "right": right}
             self._count(tok)
             ll = rl
+            # The next loop iteration wraps this node in a new bin node, so
+            # fix this node's span now; the return re-records the last one.
+            self._record(left, lf, ll)
 
     def _unary(self) -> tuple[dict, int, int]:
         tok = self._peek()
@@ -247,6 +312,7 @@ class _Parser:
             self._claim(mi, of, operand, "lead")
             node = {"kind": "neg", "operand": operand}
             self._count(tok)
+            self._record(node, mi, ol)
             return node, mi, ol
         return self._postfix()
 
@@ -255,6 +321,7 @@ class _Parser:
         while True:
             tok = self._peek()
             if tok is None or tok.kind != T_PUNCT or tok.value != "(":
+                self._record(node, nf, nl)
                 return node, nf, nl
             oi = self.pos
             self._take("(")
@@ -285,6 +352,9 @@ class _Parser:
             node = {"kind": "call", "callee": node, "args": args}
             self._count(tok if tok is not None else close_tok)
             nl = ci
+            # A later '()' iteration wraps this node in a new call node, so
+            # this node's final span must be fixed here, not at the return.
+            self._record(node, nf, nl)
 
     def _primary(self) -> tuple[dict, int, int]:
         tok = self._peek()
@@ -296,12 +366,14 @@ class _Parser:
             self._take()
             node = {"kind": "num", "value": int(tok.value)}
             self._count(tok)
+            self._record(node, idx, idx)
             return node, idx, idx
         if tok.kind == T_IDENT:
             idx = self.pos
             self._take()
             node = {"kind": "var", "name": tok.value}
             self._count(tok)
+            self._record(node, idx, idx)
             return node, idx, idx
         if tok.kind == T_PUNCT and tok.value == "(":
             oi = self.pos
@@ -318,6 +390,7 @@ class _Parser:
             self._claim(oi, inner_f, node, "lead")
             self._claim(inner_l, ci, node, "trail")
             # The parens become the node's outer span for claims above.
+            self._record(node, oi, ci)
             return node, oi, ci
         raise _err(self.src, tok.start, f"unexpected token {tok.value!r}")
 
@@ -358,6 +431,8 @@ class _Parser:
                            f"two comments compete for one node {side}; "
                            "at most one lead and one trail are supported")
             node[side] = tok.value
+            self.comment_spans.setdefault(id(node), []).append(
+                (tok.start, _tok_end(tok)))
 
 
 def parse(source: str, *, max_nodes: int = MAX_NODES) -> dict:
@@ -371,6 +446,19 @@ def parse(source: str, *, max_nodes: int = MAX_NODES) -> dict:
     if not isinstance(source, str):
         raise TypeError("source must be a str")
     return _Parser(source, max_nodes).parse()
+
+
+def parse_with_spans(source: str, *, max_nodes: int = MAX_NODES):
+    """Internal companion of :func:`parse` used by :mod:`minparen.replace`.
+
+    Returns ``(tree, spans)`` where ``spans`` maps ``id(node)`` of every
+    node in the returned (validated) tree to its ``(char_start, char_end)``
+    source span, including the node's own grouping parentheses and its own
+    lead/trail comments. Not part of the public API.
+    """
+    if not isinstance(source, str):
+        raise TypeError("source must be a str")
+    return _Parser(source, max_nodes).parse(with_spans=True)
 
 
 __all__ = ["parse", "ParseError"]

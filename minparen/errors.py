@@ -39,6 +39,19 @@ class ASTError(MinParenError):
         super().__init__(f"{message} (at {path})")
 
 
+class PathError(MinParenError):
+    """A subtree locator path does not resolve against the parsed tree.
+
+    ``path`` is the offending locator string (same shape as
+    :class:`ASTError` paths, e.g. ``root.right.args[1]``).
+    """
+
+    def __init__(self, message: str, path: str):
+        self.message = message
+        self.path = path
+        super().__init__(f"{message} (path {path!r})")
+
+
 class BudgetExhaustedError(MinParenError):
     """A bounded search stopped because its candidate budget ran out.
 
@@ -55,6 +68,7 @@ __all__ = [
     "MinParenError",
     "ParseError",
     "ASTError",
+    "PathError",
     "BudgetExhaustedError",
     "NoSolutionError",
 ]
