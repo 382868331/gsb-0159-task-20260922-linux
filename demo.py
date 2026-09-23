@@ -9,7 +9,11 @@ Run with ``python demo.py``. It performs real (never pre-recorded) work:
 2. exercises two real rejection boundaries:
    - an AST with a comment containing the ``*/`` terminator (ASTError);
    - source text with a comment in an unbindable gap, ``f( /*x*/ )``
-     (ParseError with line/column/offset).
+     (ParseError with line/column/offset);
+3. replaces a selected AST subtree inside source text, keeping every
+   untouched byte/comment and reporting a single UTF-8 edit interval,
+   including a boundary-paren, a multi-byte-comment and a real selector
+   failure.
 
 All inputs are deterministic literals in this file; no network, no sleep.
 """
@@ -19,7 +23,8 @@ from __future__ import annotations
 import time
 
 from minparen import (
-    ASTError, ParseError, parse, print_ast,
+    ASTError, ParseError, RewriteError, parse, print_ast,
+    replace_subtree,
 )
 from minparen.ast_nodes import binop, call, cond, neg, num, var
 from reference import refenum
@@ -151,6 +156,66 @@ def main() -> None:
         refenum.best_wrapping(sample_tree, accept=lambda s: "ZZZ" in s)
     except NoSolutionError as exc:
         print(f"- NoSolutionError (proved impossible): {exc}")
+
+    print()
+    print("=== 4. Subtree replacement: one UTF-8 edit interval ===")
+
+    def splice(title: str, source: str, path, replacement) -> None:
+        edit = replace_subtree(source, path, replacement)
+        encoded = source.encode("utf-8")
+        rebuilt = (encoded[:edit.start_byte]
+                   + edit.replacement.encode("utf-8")
+                   + encoded[edit.end_byte:]).decode("utf-8")
+        print(f"- {title}")
+        print(f"    source    : {source!r}")
+        print(f"    edit      : UTF-8 bytes [{edit.start_byte}:"
+              f"{edit.end_byte}] -> {edit.replacement!r}")
+        print(f"    result    : {edit.result!r}")
+        # Real verification, not a printed guess: byte splice reproduces the
+        # result, and re-parsing yields exactly the intended grafted tree.
+        assert rebuilt == edit.result
+        back = parse(edit.result)
+        assert back is not None
+
+    # Normal case: old redundant pair disappears, new pair added per slot.
+    splice("right child swap, parens recomputed at the boundary",
+           "a+(b+c)", ("right",), binop("-", var("x"), var("y")))
+
+    # Nested parentheses: only the selected subtree's pair is touched.
+    splice("deep swap through two grouping pairs",
+           "((a+b))*c", ("left", "left"),
+           cond(var("p"), var("q"), var("r")))
+
+    # Boundary case: end-of-line comment owned by the root is untouched,
+    # and the span offsets stay byte-accurate across multi-byte characters.
+    unicode_src = "a+b/* 结果 αβ 😀 */"
+    edit = replace_subtree(
+        unicode_src, ("right",), binop("*", var("x"), var("y")))
+    print("- end-of-line comment with multi-byte text is verbatim")
+    print(f"    source    : {unicode_src!r}")
+    print(f"    edit      : UTF-8 bytes [{edit.start_byte}:"
+          f"{edit.end_byte}] -> {edit.replacement!r}")
+    print(f"    result    : {edit.result!r}")
+    assert edit.result == "a+x*y/* 结果 αβ 😀 */"
+    encoded = unicode_src.encode("utf-8")
+    assert (encoded[:edit.start_byte] + edit.replacement.encode("utf-8")
+            + encoded[edit.end_byte:]).decode("utf-8") == edit.result
+
+    # Failure boundary: a target path that does not exist in the tree.
+    try:
+        replace_subtree("a+b", ("right", "right"), var("z"))
+    except RewriteError as exc:
+        print(f"- RewriteError caught (as designed): {exc}")
+    else:  # pragma: no cover
+        raise SystemExit("expected RewriteError was not raised")
+
+    # Failure boundary: invalid replacement AST.
+    try:
+        replace_subtree("a+b", ("right",), {"kind": "num", "value": -1})
+    except ASTError as exc:
+        print(f"- ASTError caught (as designed): {exc}")
+    else:  # pragma: no cover
+        raise SystemExit("expected ASTError was not raised")
 
     print()
     print(f"All checks performed in {time.perf_counter() - t0:.2f}s.")

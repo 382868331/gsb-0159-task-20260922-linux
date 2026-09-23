@@ -51,10 +51,20 @@ class NoSolutionError(MinParenError):
     """A search examined every candidate and proved that none works."""
 
 
+class RewriteError(MinParenError):
+    """A subtree-replacement request cannot be carried out.
+
+    This covers selector problems (the target is missing, is not a node, or
+    does not belong to the parsed tree); the source and the replacement AST
+    keep their own error types (:class:`ParseError` and :class:`ASTError`).
+    """
+
+
 __all__ = [
     "MinParenError",
     "ParseError",
     "ASTError",
     "BudgetExhaustedError",
     "NoSolutionError",
+    "RewriteError",
 ]

@@ -6,7 +6,10 @@
   长度最短，再相同取字典序最小；
 - `parse(source)`：独立的递归下降解析器，把文本还原为**完全相同的 AST**
   （不是数值等价），并把注释确定性地绑定回节点；
-- `validate_tree(ast)`：严格的 AST 校验，返回独立的规范化副本。
+- `validate_tree(ast)`：严格的 AST 校验，返回独立的规范化副本；
+- `replace_subtree(source, target, replacement)`：在**合法表达式源码**中替换
+  一棵指定的 AST 子树，未触及文本与注释逐字节保留，按替换边界的优先级补
+  最少括号，并返回覆盖必要改动的**单个连续编辑区间**（UTF-8 字节偏移）。
 
 ## 环境与依赖
 
@@ -82,8 +85,9 @@ f/*callee*/(/*sum*/x+y)      # 分别属于 callee 与参数
 ## 接口与错误语义
 
 ```python
-from minparen import parse, print_ast, validate_tree
-from minparen import ParseError, ASTError, BudgetExhaustedError, NoSolutionError
+from minparen import parse, print_ast, validate_tree, replace_subtree
+from minparen import (ParseError, ASTError, RewriteError,
+                      BudgetExhaustedError, NoSolutionError)
 ```
 
 - `parse(source, *, max_nodes=300) -> dict`
@@ -99,6 +103,56 @@ from minparen import ParseError, ASTError, BudgetExhaustedError, NoSolutionError
 
 错误都是“可定位、显式失败”，不做静默纠正；本库没有任何有状态/批处理式的
 部分提交操作，故不存在未说明的部分变更。
+
+### 子树替换：`replace_subtree`
+
+```python
+from minparen import replace_subtree, RewriteError
+
+edit = replace_subtree("a+(b+c)", ("right",),
+                       binop("-", var("x"), var("y")))
+edit.start_byte, edit.end_byte   # 2, 7  —— 半开区间，UTF-8 字节
+edit.replacement                 # '(x-y)'
+edit.result                      # 'a+(x-y)'
+```
+
+- `replace_subtree(source, target, replacement, *, max_nodes=300) -> SubtreeEdit`
+  - `source`：合法表达式源码（`str`；非 `str` 抛 `TypeError`，语法/注释非法抛
+    `ParseError`，先于任何构造失败）。
+  - `target`：二选一。
+    1. 从根出发的键路径序列，如 `("right", "right")`、
+       `("args", 0, "callee")`；
+    2. 回调 `root -> node`，返回值必须是**解析出的那棵树里的节点对象**
+       （用回调收到的 `root` 现选）。返回别的树的节点或非节点抛
+       `RewriteError`。
+  - `replacement`：新的子树 AST（公开节点结构，可带 `lead`/`trail`）。独立
+    校验并深拷贝；非法抛 `ASTError`。
+- 行为契约：
+  - **未触及文本与注释逐字节不变**。被选节点的跨度包含它自身消耗的分组括号
+    以及绑定给它自己的注释（这些随区间一起被替换）；绑定给祖先或兄弟的注释
+    在区间之外，原样保留。因此替换掉的子树携带的冗余括号随之消失，而祖先的
+    括号不受影响。
+  - **边界按优先级补括号**：替换节点在其父节点槽位中是否加括号，复用
+    `print_ast` 的同一张槽位表（优先级 + 结合性 + 注释规则），所以边界处加的
+    括号对数量是保持树不变所需的最小值。
+  - 返回**一个连续区间**。`SubtreeEdit` 同时给出字符偏移
+    （`start_char`/`end_char`，半开）与 **UTF-8 字节**偏移
+    （`start_byte`/`end_byte`），不会切断多字节字符；`replacement` 为写入
+    文本，`result` 为拼接后的完整源码，`as_tuple()` 返回
+    `(start_byte, end_byte, replacement)`。
+  - 结果树（替换后整棵树）在产出文本前再做一次校验，因此合并后超过
+    `max_nodes` 会抛 `ASTError`。
+  - 纯函数：`source` 与 `replacement` 都不被修改；任何失败都在结果产生之前
+    抛出，不存在半更新状态。
+
+例：
+
+```text
+a+(b+c)  换 right 为 x*y  -> a+x*y        （旧括号多余，去掉）
+a+(b+c)  换 right 为 x-y  -> a+(x-y)      （右槽左结合，需补一对）
+((a+b))*c 换 left.left   -> (((p?q:r)+b))*c
+a+b/*尾*/ 换 right       -> a+x*y/*尾*/   （祖先的行尾注释保留）
+```
 
 ### 输入上限
 
@@ -144,13 +198,18 @@ from minparen import ParseError, ASTError, BudgetExhaustedError, NoSolutionError
   径问题；任何"数值"字段均为整数且不参与计算。
 - 枚举参考是测试/教学工具，候选数为 2^k，只适用于小树，不应用于 300 节点
   规模；核心打印本身是 O(n) 单次遍历。
+- `replace_subtree` 只替换**一棵**子树并返回**一个**连续编辑区间；不做错误
+  恢复式解析（源码必须合法），也不做多个编辑区间的全局最小化。目标只能是解析
+  树中真实存在的节点，不支持跨区间的文本模式匹配。
 
 ## 目录
 
 ```
-minparen/            # 本题库：ast_nodes, validation, printer, parser, errors
+minparen/            # 本题库：ast_nodes, validation, printer, parser,
+                     # rewrite（子树替换）, errors
 reference/           # 仅测试用：独立解析器 + 括号枚举最优参考（非核心）
 tests/test_minparen.py
+tests/test_rewrite.py
 demo.py
 README.md
 ```

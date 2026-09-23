@@ -41,12 +41,13 @@ _PUNCT = set("+-*/=?:(),")
 
 
 class _Tok:
-    __slots__ = ("kind", "value", "start")
+    __slots__ = ("kind", "value", "start", "end")
 
-    def __init__(self, kind: str, value: str, start: int):
+    def __init__(self, kind: str, value: str, start: int, end: int):
         self.kind = kind
         self.value = value
-        self.start = start
+        self.start = start  # character offset of the first char
+        self.end = end      # character offset just past the last char
 
 
 def _line_col(src: str, offset: int) -> tuple[int, int]:
@@ -81,11 +82,11 @@ def _tokenize(src: str) -> list[_Tok]:
                 j += 1
             if j >= n:
                 raise _err(src, i, "unterminated comment")
-            tokens.append(_Tok(T_COMMENT, src[i + 2:j], i))
+            tokens.append(_Tok(T_COMMENT, src[i + 2:j], i, j + 2))
             i = j + 2
             continue
         if ch in _PUNCT:
-            tokens.append(_Tok(T_PUNCT, ch, i))
+            tokens.append(_Tok(T_PUNCT, ch, i, i + 1))
             i += 1
             continue
         if ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ch == "_":
@@ -95,14 +96,14 @@ def _tokenize(src: str) -> list[_Tok]:
                              or ("0" <= src[j] <= "9")
                              or src[j] == "_"):
                 j += 1
-            tokens.append(_Tok(T_IDENT, src[i:j], i))
+            tokens.append(_Tok(T_IDENT, src[i:j], i, j))
             i = j
             continue
         if "0" <= ch <= "9":
             j = i + 1
             while j < n and "0" <= src[j] <= "9":
                 j += 1
-            tokens.append(_Tok(T_NUMBER, src[i:j], i))
+            tokens.append(_Tok(T_NUMBER, src[i:j], i, j))
             i = j
             continue
         raise _err(src, i, f"unexpected character {ch!r}")
@@ -118,6 +119,14 @@ class _Parser:
         self.pos = 0  # global index into self.tokens
         # (prev non-comment index, next non-comment index) -> (node, side)
         self.gaps: dict[tuple[int, int], tuple[dict, str]] = {}
+        # id(raw node) -> (first token index, last token index); the span for
+        # a grouping primary covers its enclosing parentheses.
+        self.token_spans: dict[int, tuple[int, int]] = {}
+        # id(raw node) -> indices of comment tokens bound to the node.
+        self.owned_comments: dict[int, list[int]] = {}
+
+    def _record_span(self, node: dict, first: int, last: int) -> None:
+        self.token_spans[id(node)] = (first, last)
 
     # -- token stream ------------------------------------------------------
 
@@ -156,6 +165,27 @@ class _Parser:
     # -- grammar: each method returns (node, first_idx, last_idx) ----------
 
     def parse(self) -> dict:
+        raw = self._parse_raw()
+        # Strict structural validation of the finished tree (raises ASTError
+        # only if the parser itself built something off-contract).
+        return validate_tree(raw, max_nodes=self.max_nodes)
+
+    def parse_with_spans(self) -> tuple[dict, dict[int, tuple[int, int]]]:
+        """Like :meth:`parse`, but also map each *validated-copy* node id to
+        its half-open character span ``(start, end)`` in the source.
+
+        A node's span covers its grouping parentheses (when present) and any
+        comment tokens bound to the node itself; comments bound to ancestors
+        lie outside it.
+        """
+        raw = self._parse_raw()
+        raw_spans = {nid: self._char_span(nid) for nid in self.token_spans}
+        safe = validate_tree(raw, max_nodes=self.max_nodes)
+        spans: dict[int, tuple[int, int]] = {}
+        self._pair_spans(raw, safe, raw_spans, spans)
+        return safe, spans
+
+    def _parse_raw(self) -> dict:
         root, _, _ = self._assign()
         leftover = self._peek()
         if leftover is not None:
@@ -170,11 +200,42 @@ class _Parser:
         # Document-edge gaps always belong to the root node.
         self._claim(-1, first, root, "lead")
         self._claim(last, len(self.tokens), root, "trail")
-
         self._attach_comments()
-        # Strict structural validation of the finished tree (raises ASTError
-        # only if the parser itself built something off-contract).
-        return validate_tree(root, max_nodes=self.max_nodes)
+        return root
+
+    def _char_span(self, nid: int) -> tuple[int, int]:
+        fti, lti = self.token_spans[nid]
+        start = self.tokens[fti].start
+        end = self.tokens[lti].end
+        # Comments owned by the node itself travel with its span: those
+        # inside a grouping pair already lie within the token range; ones in
+        # an operator gap sit just outside and widen the span.
+        for ci in self.owned_comments.get(nid, ()):  # pragma: no branch
+            tok = self.tokens[ci]
+            if tok.start < start:
+                start = tok.start
+            if tok.end > end:
+                end = tok.end
+        return start, end
+
+    def _pair_spans(self, raw: dict, safe: dict,
+                    raw_spans: dict[int, tuple[int, int]],
+                    out: dict[int, tuple[int, int]]) -> None:
+        out[id(safe)] = raw_spans[id(raw)]
+        kind = raw["kind"]
+        if kind == "neg":
+            self._pair_spans(raw["operand"], safe["operand"], raw_spans, out)
+        elif kind == "bin":
+            self._pair_spans(raw["left"], safe["left"], raw_spans, out)
+            self._pair_spans(raw["right"], safe["right"], raw_spans, out)
+        elif kind == "cond":
+            self._pair_spans(raw["cond"], safe["cond"], raw_spans, out)
+            self._pair_spans(raw["then"], safe["then"], raw_spans, out)
+            self._pair_spans(raw["else"], safe["else"], raw_spans, out)
+        elif kind == "call":
+            self._pair_spans(raw["callee"], safe["callee"], raw_spans, out)
+            for ra, sa in zip(raw["args"], safe["args"]):
+                self._pair_spans(ra, sa, raw_spans, out)
 
     def _assign(self) -> tuple[dict, int, int]:
         left, lf, ll = self._cond()
@@ -187,6 +248,7 @@ class _Parser:
             self._claim(oi, rf, right, "lead")
             node = {"kind": "bin", "op": "=", "left": left, "right": right}
             self._count(tok)
+            self._record_span(node, lf, rl)
             return node, lf, rl
         return left, lf, ll
 
@@ -213,6 +275,7 @@ class _Parser:
         node = {"kind": "cond", "cond": test, "then": then,
                 "else": else_node}
         self._count(tok)
+        self._record_span(node, tf, el)
         return node, tf, el
 
     def _add(self) -> tuple[dict, int, int]:
@@ -236,6 +299,7 @@ class _Parser:
             left = {"kind": "bin", "op": tok.value, "left": left,
                     "right": right}
             self._count(tok)
+            self._record_span(left, lf, rl)
             ll = rl
 
     def _unary(self) -> tuple[dict, int, int]:
@@ -247,6 +311,7 @@ class _Parser:
             self._claim(mi, of, operand, "lead")
             node = {"kind": "neg", "operand": operand}
             self._count(tok)
+            self._record_span(node, mi, ol)
             return node, mi, ol
         return self._postfix()
 
@@ -284,6 +349,7 @@ class _Parser:
             self._claim(nl, oi, node, "trail")
             node = {"kind": "call", "callee": node, "args": args}
             self._count(tok if tok is not None else close_tok)
+            self._record_span(node, nf, ci)
             nl = ci
 
     def _primary(self) -> tuple[dict, int, int]:
@@ -296,12 +362,14 @@ class _Parser:
             self._take()
             node = {"kind": "num", "value": int(tok.value)}
             self._count(tok)
+            self._record_span(node, idx, idx)
             return node, idx, idx
         if tok.kind == T_IDENT:
             idx = self.pos
             self._take()
             node = {"kind": "var", "name": tok.value}
             self._count(tok)
+            self._record_span(node, idx, idx)
             return node, idx, idx
         if tok.kind == T_PUNCT and tok.value == "(":
             oi = self.pos
@@ -317,7 +385,9 @@ class _Parser:
             self._take(")")
             self._claim(oi, inner_f, node, "lead")
             self._claim(inner_l, ci, node, "trail")
-            # The parens become the node's outer span for claims above.
+            # The parens become the node's outer span for claims above;
+            # overwrite the inner node's own recorded span.
+            self._record_span(node, oi, ci)
             return node, oi, ci
         raise _err(self.src, tok.start, f"unexpected token {tok.value!r}")
 
@@ -358,6 +428,7 @@ class _Parser:
                            f"two comments compete for one node {side}; "
                            "at most one lead and one trail are supported")
             node[side] = tok.value
+            self.owned_comments.setdefault(id(node), []).append(ci)
 
 
 def parse(source: str, *, max_nodes: int = MAX_NODES) -> dict:
