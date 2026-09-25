@@ -51,6 +51,12 @@ minimum-length form.
 
 from __future__ import annotations
 
+# The single emission traversal at the bottom of this module records, for
+# every node, exactly where its span / syntax core / auto-added parens /
+# comments / operators land in the output. print_ast discards that record;
+# minparen.mapping.print_ast_mapped exposes it. Both share _print_with_map,
+# so the mapped text is identical to the plain text by construction.
+
 # Binding levels.
 L_ASSIGN, L_COND, L_ADD, L_MUL, L_UNARY, L_CALL, L_LEAF = range(1, 8)
 
@@ -118,32 +124,99 @@ def _needs_parens(node: dict, parent: dict, side: str) -> bool:
     return False
 
 
-def _emit(node: dict, parent: dict | None, side: str) -> str:
-    kind = node["kind"]
-    if kind == "num":
-        core = str(node["value"])
-    elif kind == "var":
-        core = node["name"]
-    elif kind == "neg":
-        core = "-" + _emit(node["operand"], node, "operand")
-    elif kind == "bin":
-        core = (_emit(node["left"], node, "left") + node["op"]
-                + _emit(node["right"], node, "right"))
-    elif kind == "cond":
-        core = (_emit(node["cond"], node, "cond") + "?"
-                + _emit(node["then"], node, "then") + ":"
-                + _emit(node["else"], node, "else"))
-    else:  # call
-        callee = _emit(node["callee"], node, "callee")
-        args = ",".join(_emit(arg, node, f"arg{i}")
-                        for i, arg in enumerate(node["args"]))
-        core = f"{callee}({args})"
+class _Recorder:
+    """Accumulates the output text and one mutable record per node.
 
-    lead = "" if node.get("lead") is None else f"/*{node['lead']}*/"
-    trail = "" if node.get("trail") is None else f"/*{node['trail']}*/"
-    if parent is not None and _needs_parens(node, parent, side):
-        return f"({lead}{core}{trail})"
-    return f"{lead}{core}{trail}"
+    Records are appended in pre-order (a node before its children) and are
+    converted into immutable public objects by :mod:`minparen.mapping`.
+    All offsets are 0-based Python string offsets, half-open ``[start, end)``.
+    """
+
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+        self.pos: int = 0
+        self.nodes: list[dict] = []
+
+    def write(self, s: str) -> tuple[int, int]:
+        start = self.pos
+        self.parts.append(s)
+        self.pos += len(s)
+        return (start, self.pos)
+
+
+def _emit(node: dict, parent: dict | None, side: str, path: str,
+          depth: int, rec: _Recorder) -> None:
+    kind = node["kind"]
+    record = {"path": path, "kind": kind, "depth": depth,
+              "parens": None, "lead": None, "trail": None,
+              "lead_text": None, "trail_text": None, "operators": []}
+    rec.nodes.append(record)
+    start = rec.pos
+
+    need = parent is not None and _needs_parens(node, parent, side)
+    paren_open = None
+    if need:
+        paren_open = rec.write("(")[0]
+
+    lead = node.get("lead")
+    if lead is not None:
+        record["lead"] = rec.write(f"/*{lead}*/")
+        record["lead_text"] = lead
+
+    core_start = rec.pos
+    if kind == "num":
+        rec.write(str(node["value"]))
+    elif kind == "var":
+        rec.write(node["name"])
+    elif kind == "neg":
+        record["operators"].append(("-", rec.write("-")))
+        _emit(node["operand"], node, "operand", f"{path}.operand",
+              depth + 1, rec)
+    elif kind == "bin":
+        _emit(node["left"], node, "left", f"{path}.left", depth + 1, rec)
+        record["operators"].append((node["op"], rec.write(node["op"])))
+        _emit(node["right"], node, "right", f"{path}.right", depth + 1, rec)
+    elif kind == "cond":
+        _emit(node["cond"], node, "cond", f"{path}.cond", depth + 1, rec)
+        record["operators"].append(("?", rec.write("?")))
+        _emit(node["then"], node, "then", f"{path}.then", depth + 1, rec)
+        record["operators"].append((":", rec.write(":")))
+        _emit(node["else"], node, "else", f"{path}.else", depth + 1, rec)
+    else:  # call
+        _emit(node["callee"], node, "callee", f"{path}.callee", depth + 1, rec)
+        record["operators"].append(("(", rec.write("(")))
+        for i, arg in enumerate(node["args"]):
+            if i:
+                record["operators"].append((",", rec.write(",")))
+            _emit(arg, node, f"arg{i}", f"{path}.args[{i}]", depth + 1, rec)
+        record["operators"].append((")", rec.write(")")))
+    core_end = rec.pos
+
+    trail = node.get("trail")
+    if trail is not None:
+        record["trail"] = rec.write(f"/*{trail}*/")
+        record["trail_text"] = trail
+
+    if need:
+        record["parens"] = ((paren_open, paren_open + 1), rec.write(")"))
+
+    record["core"] = (core_start, core_end)
+    record["span"] = (start, rec.pos)
+
+
+def _print_with_map(root: dict) -> tuple[str, list[dict]]:
+    """Validate ``root`` and return ``(text, raw node records)``.
+
+    This is the single traversal behind both :func:`print_ast` and
+    :func:`minparen.mapping.print_ast_mapped`, so the plain text and the
+    mapped text are identical by construction.
+    """
+    from .validation import validate_tree
+
+    safe = validate_tree(root)
+    rec = _Recorder()
+    _emit(safe, None, "root", "root", 0, rec)
+    return "".join(rec.parts), rec.nodes
 
 
 def print_ast(root: dict) -> str:
@@ -153,10 +226,8 @@ def print_ast(root: dict) -> str:
     contract violation. The input is not mutated; it is copied during
     validation.
     """
-    from .validation import validate_tree
-
-    safe = validate_tree(root)
-    return _emit(safe, None, "root")
+    text, _ = _print_with_map(root)
+    return text
 
 
 __all__ = ["print_ast"]

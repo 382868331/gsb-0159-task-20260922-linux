@@ -9,7 +9,10 @@ Run with ``python demo.py``. It performs real (never pre-recorded) work:
 2. exercises two real rejection boundaries:
    - an AST with a comment containing the ``*/`` terminator (ASTError);
    - source text with a comment in an unbindable gap, ``f( /*x*/ )``
-     (ParseError with line/column/offset).
+     (ParseError with line/column/offset);
+3. prints one tree with the position map (node spans, operator spans,
+   comment spans), verifies every core slice re-parses to its subtree and
+   classifies every offset with the query API.
 
 All inputs are deterministic literals in this file; no network, no sleep.
 """
@@ -19,7 +22,7 @@ from __future__ import annotations
 import time
 
 from minparen import (
-    ASTError, ParseError, parse, print_ast,
+    ASTError, ParseError, parse, print_ast, print_ast_mapped,
 )
 from minparen.ast_nodes import binop, call, cond, neg, num, var
 from reference import refenum
@@ -151,6 +154,60 @@ def main() -> None:
         refenum.best_wrapping(sample_tree, accept=lambda s: "ZZZ" in s)
     except NoSolutionError as exc:
         print(f"- NoSolutionError (proved impossible): {exc}")
+
+    print()
+    print("=== 4. Position mapping: text offsets -> AST nodes ===")
+    # One tree combining a ternary, right-associative assignment, a
+    # negation chain and a non-ASCII comment.
+    tree = cond(
+        var("flag"),
+        binop("=", var("x"),
+              binop("=", var("y"), neg(neg(var("z"))))),
+        call(var("f"), [var("v", lead="注释✓")]),
+    )
+    mapped = print_ast_mapped(tree)
+    assert mapped.text == print_ast(tree)
+    print(f"- text    : {mapped.text}")
+    print("- nodes   : path -> span / core / parens / operators")
+    for n in mapped.nodes:
+        ops = " ".join(f"{s}{a}:{b}" for s, (a, b)
+                       in ((o.symbol, o.span) for o in n.operators))
+        print(f"    {n.path:<22} {n.span} core={n.core} "
+              f"parens={n.parens} ops=[{ops}]")
+    print("- comments:")
+    for c in mapped.comments:
+        print(f"    {c.side} of {c.path}: {c.span} text={c.text!r}")
+    # Live verification, not pre-recorded: every core slice re-parses to
+    # the corresponding subtree (root comments excluded from the core).
+    def subtree_at(root, path):
+        node = root
+        for part in path.split(".")[1:]:
+            node = (node["args"][int(part[5:-1])]
+                    if part.startswith("args[") else node[part])
+        return node
+
+    def without_own_comments(node):
+        return {k: v for k, v in node.items()
+                if k not in ("lead", "trail")}
+
+    checked = 0
+    for n in mapped.nodes:
+        core_text = mapped.text[n.core[0]:n.core[1]]
+        want = without_own_comments(subtree_at(tree, n.path))
+        assert parse(core_text) == want, (n.path, core_text)
+        checked += 1
+    print(f"- all {checked} core slices re-parse to their subtree: OK")
+    # A few position queries (half-open boundary rules).
+    print("- queries : offset -> category / owner path / detail")
+    for offset in (0, 4, 6, 10, 11, 15, 20, len(mapped.text) - 1):
+        info = mapped.query(offset)
+        ch = mapped.text[offset]
+        print(f"    [{offset:>2}] {ch!r:<6} {info.category:<9} "
+              f"path={info.path} detail={info.detail}")
+    # Every offset classified; none silently forced onto a neighbour.
+    for offset in range(len(mapped.text)):
+        mapped.query(offset)
+    print(f"- all {len(mapped.text)} offsets classified by query(): OK")
 
     print()
     print(f"All checks performed in {time.perf_counter() - t0:.2f}s.")
