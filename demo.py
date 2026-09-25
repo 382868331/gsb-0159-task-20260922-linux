@@ -19,7 +19,7 @@ from __future__ import annotations
 import time
 
 from minparen import (
-    ASTError, ParseError, parse, print_ast,
+    ASTError, ParseError, parse, print_ast, print_ast_mapped,
 )
 from minparen.ast_nodes import binop, call, cond, neg, num, var
 from reference import refenum
@@ -42,6 +42,17 @@ def _children(node):
     if k == "call":
         return [node["callee"], *node["args"]]
     return []
+
+
+def _bare(node):
+    out = {k: v for k, v in node.items() if k not in ("lead", "trail")}
+    for key in ("operand", "left", "right", "cond", "then", "else",
+                "callee"):
+        if key in out:
+            out[key] = _bare(out[key])
+    if "args" in out:
+        out["args"] = [_bare(a) for a in out["args"]]
+    return out
 
 
 def to_ref(node):
@@ -151,6 +162,40 @@ def main() -> None:
         refenum.best_wrapping(sample_tree, accept=lambda s: "ZZZ" in s)
     except NoSolutionError as exc:
         print(f"- NoSolutionError (proved impossible): {exc}")
+
+    print()
+    print("=== 4. Position-mapped printing (editor jumps) ===")
+    tree = cond(var("a"),
+                binop("=", var("b"), neg(neg(var("c")))),
+                binop("+", var("d", lead="注"), var("e")))
+    mp = print_ast_mapped(tree)
+    print(f"- text    : {mp.text}")
+    assert mp.text == print_ast(tree)
+    print("- nodes   : path -> core / span (half-open char offsets)")
+    for ns in mp.nodes:
+        print(f"    {ns.path:<14} core={ns.core} span={ns.span}"
+              f" parens={ns.parens} lead={ns.lead} trail={ns.trail}")
+        # Independent check: every core substring re-parses to the
+        # node's subtree (compared comment-free on both sides).
+        assert _bare(parse(mp.text[ns.core[0]:ns.core[1]])) == _bare(ns.node)
+    print("- operators:")
+    for o in mp.operators:
+        kind = "unary " if o.unary else ""
+        print(f"    {kind}{o.op!r} at {o.span}  owner={o.path}")
+    print("- comments:")
+    for c in mp.comments:
+        print(f"    /*{c.text}*/ at {c.span}  owner={c.path} side={c.side}")
+    print("- queries (offset -> category):")
+    for off in (0, 2, 3, 8, 9, 14, 15):
+        r = mp.query(off)
+        target = r.node.path if r.node else "-"
+        print(f"    offset {off:>2} {mp.text[off]!r:>6} -> {r.category:<9}"
+              f" node={target}")
+    # Jump back: from a printed offset to the AST node object.
+    hit = mp.query(9)
+    jumped = mp.resolve(hit.node.path)
+    print(f"- jump back: offset 9 -> {hit.node.path} -> node {jumped}")
+    assert jumped is hit.node.node
 
     print()
     print(f"All checks performed in {time.perf_counter() - t0:.2f}s.")

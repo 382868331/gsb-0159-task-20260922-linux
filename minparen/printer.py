@@ -47,6 +47,16 @@ added, and placing the pair around the owner (rather than a higher
 ancestor) puts the closing ``)`` as early as possible; since ``)`` sorts
 before every operator punctuation, that is the lexicographically smallest
 minimum-length form.
+
+Position mapping
+----------------
+
+:func:`_render` is the single emission path behind both :func:`print_ast`
+and :func:`minparen.mapped.print_ast_mapped`. It walks the validated tree
+once, writing into a cursor-based recorder, so every span it reports is the
+exact half-open ``[start, end)`` character range of the emitted text --
+never derived by searching the output for equal substrings (two identical
+subtrees still get two distinct, correct spans).
 """
 
 from __future__ import annotations
@@ -118,32 +128,121 @@ def _needs_parens(node: dict, parent: dict, side: str) -> bool:
     return False
 
 
-def _emit(node: dict, parent: dict | None, side: str) -> str:
-    kind = node["kind"]
-    if kind == "num":
-        core = str(node["value"])
-    elif kind == "var":
-        core = node["name"]
-    elif kind == "neg":
-        core = "-" + _emit(node["operand"], node, "operand")
-    elif kind == "bin":
-        core = (_emit(node["left"], node, "left") + node["op"]
-                + _emit(node["right"], node, "right"))
-    elif kind == "cond":
-        core = (_emit(node["cond"], node, "cond") + "?"
-                + _emit(node["then"], node, "then") + ":"
-                + _emit(node["else"], node, "else"))
-    else:  # call
-        callee = _emit(node["callee"], node, "callee")
-        args = ",".join(_emit(arg, node, f"arg{i}")
-                        for i, arg in enumerate(node["args"]))
-        core = f"{callee}({args})"
+class _Recorder:
+    """Emission buffer that remembers where every piece landed.
 
-    lead = "" if node.get("lead") is None else f"/*{node['lead']}*/"
-    trail = "" if node.get("trail") is None else f"/*{node['trail']}*/"
-    if parent is not None and _needs_parens(node, parent, side):
-        return f"({lead}{core}{trail})"
-    return f"{lead}{core}{trail}"
+    ``pos`` is the cursor: the next character written lands at this offset.
+    Spans are half-open ``(start, end)`` pairs of Python string offsets.
+    """
+
+    __slots__ = ("parts", "pos", "nodes", "operators", "comments")
+
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+        self.pos = 0
+        self.nodes: list[dict] = []       # pre-order node span records
+        self.operators: list[dict] = []   # operator token records
+        self.comments: list[dict] = []    # comment token records
+
+    def write(self, s: str) -> tuple[int, int]:
+        start = self.pos
+        self.parts.append(s)
+        self.pos += len(s)
+        return (start, self.pos)
+
+
+def _emit(node: dict, parent: dict | None, side: str, path: str,
+          rec: _Recorder) -> None:
+    """Emit ``node`` and record its spans.
+
+    Layout per node (parens only when the slot requires them)::
+
+        (  /*lead*/  core  /*trail*/  )      <- with auto-added parens
+        /*lead*/  core  /*trail*/            <- without
+
+    The auto-added parens belong to this node (recorded in its entry and
+    covered by its ``span``); the lead/trail comments are mapped separately
+    and stay outside the node's ``core`` span; a parent's ``span`` always
+    covers the spans of its children.
+    """
+    kind = node["kind"]
+    entry: dict = {"path": path, "kind": kind, "node": node,
+                   "lead": None, "trail": None, "parens": None}
+    rec.nodes.append(entry)
+
+    lead = node.get("lead")
+    trail = node.get("trail")
+    parens = parent is not None and _needs_parens(node, parent, side)
+
+    open_span = close_span = None
+    if parens:
+        open_span = rec.write("(")
+    if lead is not None:
+        entry["lead"] = rec.write(f"/*{lead}*/")
+        rec.comments.append({"span": entry["lead"], "text": lead,
+                             "path": path, "side": "lead"})
+
+    core_start = rec.pos
+    if kind == "num":
+        rec.write(str(node["value"]))
+    elif kind == "var":
+        rec.write(node["name"])
+    elif kind == "neg":
+        rec.operators.append({"op": "-", "unary": True,
+                              "span": rec.write("-"), "path": path})
+        _emit(node["operand"], node, "operand", f"{path}.operand", rec)
+    elif kind == "bin":
+        _emit(node["left"], node, "left", f"{path}.left", rec)
+        rec.operators.append({"op": node["op"], "unary": False,
+                              "span": rec.write(node["op"]), "path": path})
+        _emit(node["right"], node, "right", f"{path}.right", rec)
+    elif kind == "cond":
+        _emit(node["cond"], node, "cond", f"{path}.cond", rec)
+        rec.operators.append({"op": "?", "unary": False,
+                              "span": rec.write("?"), "path": path})
+        _emit(node["then"], node, "then", f"{path}.then", rec)
+        rec.operators.append({"op": ":", "unary": False,
+                              "span": rec.write(":"), "path": path})
+        _emit(node["else"], node, "else", f"{path}.else", rec)
+    else:  # call
+        _emit(node["callee"], node, "callee", f"{path}.callee", rec)
+        rec.write("(")
+        for i, arg in enumerate(node["args"]):
+            if i:
+                rec.write(",")
+            _emit(arg, node, f"arg{i}", f"{path}.args[{i}]", rec)
+        rec.write(")")
+    core_end = rec.pos
+    entry["core"] = (core_start, core_end)
+
+    if trail is not None:
+        entry["trail"] = rec.write(f"/*{trail}*/")
+        rec.comments.append({"span": entry["trail"], "text": trail,
+                             "path": path, "side": "trail"})
+    if parens:
+        close_span = rec.write(")")
+        entry["parens"] = (open_span, close_span)
+
+    if parens:
+        entry["span"] = (open_span[0], close_span[1])
+    else:
+        start = entry["lead"][0] if lead is not None else core_start
+        end = entry["trail"][1] if trail is not None else core_end
+        entry["span"] = (start, end)
+
+
+def _render(root: dict):
+    """Validate ``root`` and emit ``(safe_tree, recorder, text)``.
+
+    Internal shared backend of :func:`print_ast` and
+    :func:`minparen.mapped.print_ast_mapped`; the input is not mutated.
+    """
+    from .validation import validate_tree
+
+    safe = validate_tree(root)
+    rec = _Recorder()
+    _emit(safe, None, "root", "root", rec)
+    return safe, rec, "".join(rec.parts)
 
 
 def print_ast(root: dict) -> str:
@@ -153,10 +252,7 @@ def print_ast(root: dict) -> str:
     contract violation. The input is not mutated; it is copied during
     validation.
     """
-    from .validation import validate_tree
-
-    safe = validate_tree(root)
-    return _emit(safe, None, "root")
+    return _render(root)[2]
 
 
 __all__ = ["print_ast"]
