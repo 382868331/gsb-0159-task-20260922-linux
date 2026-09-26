@@ -40,7 +40,7 @@ def _lex(src: str) -> list[str]:
     i, n = 0, len(src)
     while i < n:
         ch = src[i]
-        if ch in " \t":
+        if ch in " \t\n\r":
             i += 1
         elif ch in _PUNCT:
             out.append(ch)

@@ -46,6 +46,12 @@ class BudgetExhaustedError(MinParenError):
     not proven absent.
     """
 
+    def __init__(self, message: str = "search budget exhausted", *, best=None):
+        # ``best`` optionally carries the best legal candidate found so far
+        # (never proven optimal); None when the search has no usable partial.
+        self.best = best
+        super().__init__(message)
+
 
 class NoSolutionError(MinParenError):
     """A search examined every candidate and proved that none works."""
