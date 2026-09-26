@@ -20,8 +20,21 @@
 
 ```bash
 python -m unittest discover -s tests -v   # 必要测试（约几秒到几十秒）
-python demo.py                            # 固定输入演示，约 0.1 秒
+python demo.py                            # 最小括号演示，约 0.1 秒
+python demo_iteration.py                  # 本次迭代：宽度感知布局演示，约 0.1 秒
 ```
+
+## venv 准备
+
+不需要任何第三方包，venv 只是为了隔离解释器：
+
+```bash
+python3.14 -m venv .venv        # 或任何指向 Python 3.14.7 的方式
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python demo_iteration.py
+```
+
+也可以直接用系统 `python`（确认为 3.14.7 即可），不安装任何依赖。
 
 ## 语言与 AST
 
@@ -115,6 +128,49 @@ from minparen import ParseError, ASTError, BudgetExhaustedError, NoSolutionError
 - 搜尽全部候选仍没有满足附加条件的串时抛 `NoSolutionError`
   （已证明无解）。
 
+## 本次迭代：按列宽选择换行（format_ast）
+
+短表达式仍用 `print_ast`（单行、括号最少）。当表达式太长时，新接口
+`format_ast(root, width=80, *, budget=None)` 在**不改变语法括号**的前提下，
+为每个“组”选择**平铺**或**缩进展开**：
+
+- 函数调用 `f(...)`：一行平铺，或 `f(` 后每参数一行、最后 `)` 对齐 callee；
+- 二元表达式 `a+b`：一行平铺，或在运算符后换行，右侧缩进 2 列；
+- 条件表达式 `a?b:c`：一行平铺，或 `?`/`:` 后换行，两个分支各缩进 2 列；
+- 前缀负号不自己换行，只把操作数交给同一套选择；
+- 叶子（标识符/整数）不可拆：超过列宽就溢出，**溢出计入惩罚**。
+
+括号数量与位置完全由语法优先级决定（沿用 `printer.py` 的槽位表），
+**不会**为了布局好看而多加括号；注释仍绑定在原节点的首行/末行。
+
+### 惩罚与最优性
+
+惩罚按字典序依次比较：
+
+1. **溢出字符总数**（所有行超出 `width` 的字符数之和）；
+2. **换行数**；
+3. **输出文本的字典序**。
+
+`width` 接受 **1 到 80** 的整数（含端点；`bool`/`float`/`str` 抛 `TypeError`，
+越界抛 `ValueError`）。该区间内每个宽度都有**唯一确定且可证最优**的结果：
+核心按 (节点, 列) 子问题做动态规划，每个子问题保留一个 Pareto 前沿
+（父节点会在子节点末行追加 ` +`、` ?`、` :`、`(`、`,`，所以只记单一最优
+会漏解），子问题只解一次并记忆化，较大的树不会枚举 2^k 种组合。
+
+### 布局预算：已找到 ≠ 已证最优
+
+`budget` 限制求解的子问题个数。预算耗尽时抛 `BudgetExhaustedError`，
+异常的 `best_effort` 属性携带一个**合法但未证最优**的布局（完全平铺形式，
+重新解析仍得到同一棵树）——这与正常返回的**已证最优**结果是两种语义，
+也和 `NoSolutionError`（枚举尽所有布局仍不满足附加条件）不同。
+
+### 独立核对
+
+`reference/layout_enum.py` 是独立书写的第二份实现（自己的优先级表、
+自己的平铺/展开构造器），对小树**枚举所有合法布局**取惩罚最小者；
+测试在宽度 1–80 上与核心 DP 逐字节比对，并对所有宽度做
+`parse(format_ast(t, w)) == t` 往返校验。
+
 ## 最小括号是怎么保证的
 
 1. **结构性括号**：某子节点在某个父槽位中“不加括号能否原样解析回来”只取决于
@@ -144,13 +200,21 @@ from minparen import ParseError, ASTError, BudgetExhaustedError, NoSolutionError
   径问题；任何"数值"字段均为整数且不参与计算。
 - 枚举参考是测试/教学工具，候选数为 2^k，只适用于小树，不应用于 300 节点
   规模；核心打印本身是 O(n) 单次遍历。
+- 布局迭代（`format_ast`）的已知限制：缩进固定为 2 列；列宽上限 80（接口
+  边界，不是算法限制）；换行点只在组边界（运算符后、`?`/`:` 后、调用参数
+  之间），不在 token 内部断行；布局枚举参考 `reference/layout_enum.py`
+  同样只适用于小树。
 
 ## 目录
 
 ```
-minparen/            # 本题库：ast_nodes, validation, printer, parser, errors
-reference/           # 仅测试用：独立解析器 + 括号枚举最优参考（非核心）
-tests/test_minparen.py
-demo.py
+minparen/            # 本题库：ast_nodes, validation, printer, parser, errors,
+                     #   layout（本次迭代：宽度感知布局）
+reference/           # 仅测试用：独立解析器 + 括号枚举最优参考（refenum）
+                     #   + 布局枚举最优参考（layout_enum，非核心）
+tests/test_minparen.py   # 旧接口回归测试（保持不变）
+tests/test_layout.py     # 本次迭代的布局测试
+demo.py              # 最小括号演示（旧）
+demo_iteration.py    # 本次迭代演示：同一棵树两种窄宽排版 + 边界情况
 README.md
 ```
