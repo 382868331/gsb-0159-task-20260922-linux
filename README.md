@@ -82,7 +82,7 @@ f/*callee*/(/*sum*/x+y)      # 分别属于 callee 与参数
 ## 接口与错误语义
 
 ```python
-from minparen import parse, print_ast, validate_tree
+from minparen import parse, print_ast, print_ast_mapped, validate_tree
 from minparen import ParseError, ASTError, BudgetExhaustedError, NoSolutionError
 ```
 
@@ -96,6 +96,33 @@ from minparen import ParseError, ASTError, BudgetExhaustedError, NoSolutionError
 - `validate_tree(root, *, max_nodes=300) -> dict`
   返回独立深拷贝；拒绝未知 `kind`、缺字段/多字段、错误类型、`bool` 数值、
   负数、非法标识符、共享/循环引用、超过 300 节点。
+
+### 位置映射（编辑器定位）
+
+`print_ast_mapped(root) -> PrintResult` 输出与 `print_ast` **逐字节相同**的
+最少括号文本，同时为每个 AST 节点出现位置提供输出区间：
+
+```python
+result = print_ast_mapped(tree)
+result.text          # 与 print_ast(tree) 相同
+result.spans         # 每个节点一个 NodeSpan（按路径唯一）
+result.span_for("root.right")   # 按路径查区间
+result.node_at(7)    # 按输出偏移查最内层节点
+```
+
+`NodeSpan` 字段：
+
+- `path`：从根开始的访问路径（如 `root.right.args[0]`）。相同子表达式在
+  不同位置出现时是不同节点，各自有独立的 span，不会混淆；
+- `start`/`end`：0 基半开区间，覆盖节点自身的一切（含为它所加的括号与
+  它的 lead/trail 注释）；`core_start`/`core_end` 排除新增括号、保留注释；
+- `parens`：括号归属解释——`added-structural`（父槽位结构上必须加，见
+  `_SLOTS`）、`added-comment`（结构可省略，但节点自身注释所在的间隙归
+  外层节点认领，为保持注释归属而加）、`omitted-tight`（槽位允许，省略）；
+- `slot`：父槽位标签（如 `bin+.right`、`call.callee`，根为 `root`）。
+
+区间关系与表达式层次一致：父节点区间严格包含子节点区间，兄弟区间互不相交
+且按文本顺序排列；根节点区间即整个输出文本。
 
 错误都是“可定位、显式失败”，不做静默纠正；本库没有任何有状态/批处理式的
 部分提交操作，故不存在未说明的部分变更。

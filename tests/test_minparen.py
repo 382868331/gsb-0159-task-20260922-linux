@@ -17,7 +17,7 @@ import unittest
 
 from minparen import (
     ASTError, BudgetExhaustedError, NoSolutionError, ParseError,
-    parse, print_ast, validate_tree,
+    parse, print_ast, print_ast_mapped, validate_tree,
 )
 from minparen.ast_nodes import binop, call, cond, neg, num, var
 from reference import refenum
@@ -419,6 +419,157 @@ class RoundTripTests(unittest.TestCase):
             text = print_ast(from_ref(tree))
             again = parse(text)
             self.assertEqual(print_ast(again), text)
+
+
+# --------------------------------------------------------------------------
+# Source-map tests: print_ast_mapped
+# --------------------------------------------------------------------------
+
+def _walk_paths(node, path="root"):
+    """Yield the accessor path of every node in a dict AST."""
+    yield path
+    kind = node["kind"]
+    if kind == "neg":
+        yield from _walk_paths(node["operand"], path + ".operand")
+    elif kind == "bin":
+        yield from _walk_paths(node["left"], path + ".left")
+        yield from _walk_paths(node["right"], path + ".right")
+    elif kind == "cond":
+        yield from _walk_paths(node["cond"], path + ".cond")
+        yield from _walk_paths(node["then"], path + ".then")
+        yield from _walk_paths(node["else"], path + ".else")
+    elif kind == "call":
+        yield from _walk_paths(node["callee"], path + ".callee")
+        for i, arg in enumerate(node["args"]):
+            yield from _walk_paths(arg, path + ".args[" + str(i) + "]")
+
+
+def _node_at_path(node, path):
+    for part in path.split(".")[1:]:
+        if part.startswith("args["):
+            node = node["args"][int(part[5:-1])]
+        else:
+            node = node[part]
+    return node
+
+
+class SourceMapTests(unittest.TestCase):
+    def _check_tree(self, tree):
+        result = print_ast_mapped(tree)
+        # Same text as the plain printer.
+        self.assertEqual(result.text, print_ast(tree))
+        # One span per node occurrence, keyed by its unique path.
+        paths = list(_walk_paths(tree))
+        self.assertEqual(sorted(s.path for s in result.spans),
+                         sorted(paths))
+        self.assertEqual(len({s.path for s in result.spans}),
+                         len(result.spans))
+        root = result.span_for("root")
+        self.assertEqual((root.start, root.end), (0, len(result.text)))
+        for span in result.spans:
+            node = _node_at_path(tree, span.path)
+            self.assertEqual(span.kind, node["kind"])
+            # Offsets are sane and the core sits inside the full span.
+            self.assertLessEqual(span.start, span.core_start)
+            self.assertLessEqual(span.core_start, span.core_end)
+            self.assertLessEqual(span.core_end, span.end)
+            # Added parens literally surround the core.
+            if span.parens.startswith("added"):
+                self.assertEqual(result.text[span.start], "(")
+                self.assertEqual(result.text[span.end - 1], ")")
+                self.assertEqual(span.core_start, span.start + 1)
+                self.assertEqual(span.core_end, span.end - 1)
+            else:
+                self.assertEqual(span.parens, "omitted-tight")
+                self.assertEqual((span.start, span.end),
+                                 (span.core_start, span.core_end))
+            # The node's own comments are inside its core span.
+            core = result.text[span.core_start:span.core_end]
+            if node.get("lead") is not None:
+                self.assertTrue(core.startswith("/*" + node["lead"] + "*/"))
+            if node.get("trail") is not None:
+                self.assertTrue(core.endswith("/*" + node["trail"] + "*/"))
+        # Nesting is consistent with the AST hierarchy: every child's
+        # span is strictly inside its parent's span.
+        by_path = {s.path: s for s in result.spans}
+        for span in result.spans:
+            if span.path == "root":
+                continue
+            parent_path = span.path.rsplit(".", 1)[0]
+            parent = by_path[parent_path]
+            self.assertLessEqual(parent.start, span.start)
+            self.assertGreaterEqual(parent.end, span.end)
+            self.assertLess(span.end - span.start,
+                            parent.end - parent.start)
+        # Every offset maps back to some node; the innermost mapping of
+        # a leaf's text is that leaf.
+        for offset in range(len(result.text)):
+            self.assertIsNotNone(result.node_at(offset))
+        return result
+
+    def test_mapped_matches_print_ast_on_enumeration_trees(self):
+        for tree in gen_trees(max_nodes=8, max_depth=4)[::53]:
+            self._check_tree(from_ref(tree))
+
+    def test_identical_subexpressions_get_distinct_spans(self):
+        tree = binop("+", var("x"), var("x"))
+        result = self._check_tree(tree)
+        self.assertEqual(result.text, "x+x")
+        left = result.span_for("root.left")
+        right = result.span_for("root.right")
+        self.assertEqual((left.start, left.end), (0, 1))
+        self.assertEqual((right.start, right.end), (2, 3))
+        self.assertEqual(result.node_at(0).path, "root.left")
+        self.assertEqual(result.node_at(2).path, "root.right")
+        self.assertEqual(result.node_at(1).path, "root")
+
+    def test_structural_parens_attribution(self):
+        tree = binop("-", var("a"), binop("-", var("b"), var("c")))
+        result = self._check_tree(tree)
+        self.assertEqual(result.text, "a-(b-c)")
+        span = result.span_for("root.right")
+        self.assertEqual(span.parens, "added-structural")
+        self.assertEqual(span.slot, "bin+.right")
+        self.assertEqual(result.text[span.start:span.end], "(b-c)")
+        self.assertEqual(result.text[span.core_start:span.core_end], "b-c")
+        self.assertEqual(result.span_for("root.left").parens,
+                         "omitted-tight")
+
+    def test_comment_forced_parens_attribution(self):
+        tree = binop("+", var("a", lead="L"), var("b"))
+        result = self._check_tree(tree)
+        self.assertEqual(result.text, "(/*L*/a)+b")
+        span = result.span_for("root.left")
+        self.assertEqual(span.parens, "added-comment")
+        self.assertEqual(result.text[span.start:span.end], "(/*L*/a)")
+
+    def test_nested_cond_and_neg_spans(self):
+        tree = cond(var("a"), neg(var("b")),
+                    cond(var("c"), var("d"), var("e")))
+        result = self._check_tree(tree)
+        self.assertEqual(result.text, "a?-b:c?d:e")
+        inner = result.span_for("root.else")
+        self.assertEqual(result.text[inner.start:inner.end], "c?d:e")
+        self.assertEqual(result.node_at(result.text.index("-")).path,
+                         "root.then")
+
+    def test_call_spans(self):
+        tree = call(var("f"), [binop("+", var("x"), var("y")), num(7)])
+        result = self._check_tree(tree)
+        self.assertEqual(result.text, "f(x+y,7)")
+        arg0 = result.span_for("root.args[0]")
+        self.assertEqual(result.text[arg0.start:arg0.end], "x+y")
+        self.assertEqual(result.span_for("root.callee").slot,
+                         "call.callee")
+
+    def test_span_for_unknown_path_raises(self):
+        result = print_ast_mapped(var("a"))
+        with self.assertRaises(KeyError):
+            result.span_for("root.left")
+
+    def test_mapped_validation_still_strict(self):
+        with self.assertRaises(ASTError):
+            print_ast_mapped({"kind": "num", "value": -1})
 
 
 if __name__ == "__main__":

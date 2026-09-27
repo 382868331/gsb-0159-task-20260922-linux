@@ -51,6 +51,8 @@ minimum-length form.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 # Binding levels.
 L_ASSIGN, L_COND, L_ADD, L_MUL, L_UNARY, L_CALL, L_LEAF = range(1, 8)
 
@@ -105,45 +107,170 @@ def _slot_key(parent: dict, side: str) -> tuple[str, str]:
     return (parent["kind"], side)
 
 
-def _needs_parens(node: dict, parent: dict, side: str) -> bool:
+# Paren disposition recorded on every span:
+#   "added-structural" -- the parent slot cannot parse the child back
+#                         without a grouping pair (see _SLOTS);
+#   "added-comment"    -- the slot is structurally tight, but the node's
+#                         own lead/trail comment sits in a gap claimed by
+#                         the enclosing node, so the node carries its own
+#                         pair to keep the comment bound to itself;
+#   "omitted-tight"    -- the slot accepts the child as-is; no pair emitted.
+P_ADDED_STRUCTURAL = "added-structural"
+P_ADDED_COMMENT = "added-comment"
+P_OMITTED_TIGHT = "omitted-tight"
+
+
+def _paren_disposition(node: dict, parent: dict | None, side: str) -> str:
+    if parent is None:
+        return P_OMITTED_TIGHT
     side = _normalize_side(side)
     min_level, strict = _SLOTS[_slot_key(parent, side)]
     level = _level(node)
     if level < min_level or (strict and level == min_level):
-        return True
+        return P_ADDED_STRUCTURAL
     if node.get("lead") is not None and side in _FRONT_ENCLOSED:
-        return True
+        return P_ADDED_COMMENT
     if node.get("trail") is not None and side in _END_ENCLOSED:
-        return True
-    return False
+        return P_ADDED_COMMENT
+    return P_OMITTED_TIGHT
 
 
-def _emit(node: dict, parent: dict | None, side: str) -> str:
-    kind = node["kind"]
-    if kind == "num":
-        core = str(node["value"])
-    elif kind == "var":
-        core = node["name"]
-    elif kind == "neg":
-        core = "-" + _emit(node["operand"], node, "operand")
-    elif kind == "bin":
-        core = (_emit(node["left"], node, "left") + node["op"]
-                + _emit(node["right"], node, "right"))
-    elif kind == "cond":
-        core = (_emit(node["cond"], node, "cond") + "?"
-                + _emit(node["then"], node, "then") + ":"
-                + _emit(node["else"], node, "else"))
-    else:  # call
-        callee = _emit(node["callee"], node, "callee")
-        args = ",".join(_emit(arg, node, f"arg{i}")
-                        for i, arg in enumerate(node["args"]))
-        core = f"{callee}({args})"
+def _needs_parens(node: dict, parent: dict, side: str) -> bool:
+    return _paren_disposition(node, parent, side) != P_OMITTED_TIGHT
 
-    lead = "" if node.get("lead") is None else f"/*{node['lead']}*/"
-    trail = "" if node.get("trail") is None else f"/*{node['trail']}*/"
-    if parent is not None and _needs_parens(node, parent, side):
-        return f"({lead}{core}{trail})"
-    return f"{lead}{core}{trail}"
+
+@dataclass(frozen=True)
+class NodeSpan:
+    """Output range of one AST node occurrence in the printed text.
+
+    ``start``/``end`` are 0-based half-open offsets covering everything the
+    node owns: its own parentheses (when added) and its lead/trail comments.
+    ``core_start``/``core_end`` exclude the added parentheses but still
+    include the comments. Spans nest exactly like the AST: a parent's span
+    strictly contains every child's span, and sibling spans are disjoint and
+    ordered. Two textually identical subexpressions at different positions
+    yield two distinct spans with different ``path`` values.
+    """
+
+    path: str
+    kind: str
+    start: int
+    end: int
+    core_start: int
+    core_end: int
+    parens: str
+    slot: str
+
+    def __contains__(self, offset: int) -> bool:
+        return self.start <= offset < self.end
+
+
+@dataclass(frozen=True)
+class PrintResult:
+    """Printed text plus the per-node source map."""
+
+    text: str
+    spans: tuple[NodeSpan, ...]
+
+    def span_for(self, path: str) -> NodeSpan:
+        """Return the span of the node at ``path`` (e.g. ``root.right``)."""
+        for span in self.spans:
+            if span.path == path:
+                return span
+        raise KeyError(path)
+
+    def node_at(self, offset: int) -> NodeSpan | None:
+        """Return the innermost node whose span covers ``offset``."""
+        best: NodeSpan | None = None
+        for span in self.spans:
+            if offset in span and (
+                    best is None
+                    or span.end - span.start < best.end - best.start):
+                best = span
+        return best
+
+
+class _Emitter:
+    """Single-pass emitter that records a span for every node."""
+
+    def __init__(self) -> None:
+        self._buf: list[str] = []
+        self._len = 0
+        self.spans: list[NodeSpan] = []
+
+    def _write(self, text: str) -> None:
+        self._buf.append(text)
+        self._len += len(text)
+
+    def emit(self, node: dict, parent: dict | None, side: str,
+             path: str) -> None:
+        start = self._len
+        disposition = _paren_disposition(node, parent, side)
+        if disposition != P_OMITTED_TIGHT:
+            self._write("(")
+        core_start = self._len
+        if node.get("lead") is not None:
+            self._write("/*" + node["lead"] + "*/")
+        self._emit_core(node, path)
+        if node.get("trail") is not None:
+            self._write("/*" + node["trail"] + "*/")
+        core_end = self._len
+        if disposition != P_OMITTED_TIGHT:
+            self._write(")")
+        slot = "root" if parent is None else (
+            _slot_key(parent, _normalize_side(side))[0]
+            + "." + _normalize_side(side))
+        self.spans.append(NodeSpan(
+            path=path, kind=node["kind"], start=start, end=self._len,
+            core_start=core_start, core_end=core_end,
+            parens=disposition, slot=slot))
+
+    def _emit_core(self, node: dict, path: str) -> None:
+        kind = node["kind"]
+        if kind == "num":
+            self._write(str(node["value"]))
+        elif kind == "var":
+            self._write(node["name"])
+        elif kind == "neg":
+            self._write("-")
+            self.emit(node["operand"], node, "operand", path + ".operand")
+        elif kind == "bin":
+            self.emit(node["left"], node, "left", path + ".left")
+            self._write(node["op"])
+            self.emit(node["right"], node, "right", path + ".right")
+        elif kind == "cond":
+            self.emit(node["cond"], node, "cond", path + ".cond")
+            self._write("?")
+            self.emit(node["then"], node, "then", path + ".then")
+            self._write(":")
+            self.emit(node["else"], node, "else", path + ".else")
+        else:  # call
+            self.emit(node["callee"], node, "callee", path + ".callee")
+            self._write("(")
+            for i, arg in enumerate(node["args"]):
+                if i:
+                    self._write(",")
+                self.emit(arg, node, "arg" + str(i),
+                          path + ".args[" + str(i) + "]")
+            self._write(")")
+
+
+def print_ast_mapped(root: dict) -> PrintResult:
+    """Like ``print_ast``, but also maps every node to its output range.
+
+    The returned ``PrintResult`` carries the same minimal-parenthesis
+    text as ``print_ast`` and one ``NodeSpan`` per AST node
+    occurrence, including the paren disposition explaining why each pair
+    was added (structural slot or comment ownership) or omitted (tight
+    slot). Raises ``ASTError`` on contract violations; the input is
+    not mutated.
+    """
+    from .validation import validate_tree
+
+    safe = validate_tree(root)
+    emitter = _Emitter()
+    emitter.emit(safe, None, "root", "root")
+    return PrintResult("".join(emitter._buf), tuple(emitter.spans))
 
 
 def print_ast(root: dict) -> str:
@@ -153,10 +280,7 @@ def print_ast(root: dict) -> str:
     contract violation. The input is not mutated; it is copied during
     validation.
     """
-    from .validation import validate_tree
-
-    safe = validate_tree(root)
-    return _emit(safe, None, "root")
+    return print_ast_mapped(root).text
 
 
-__all__ = ["print_ast"]
+__all__ = ["print_ast", "print_ast_mapped", "PrintResult", "NodeSpan"]

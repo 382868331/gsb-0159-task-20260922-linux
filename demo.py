@@ -19,7 +19,7 @@ from __future__ import annotations
 import time
 
 from minparen import (
-    ASTError, ParseError, parse, print_ast,
+    ASTError, ParseError, parse, print_ast, print_ast_mapped,
 )
 from minparen.ast_nodes import binop, call, cond, neg, num, var
 from reference import refenum
@@ -120,7 +120,23 @@ def main() -> None:
     assert text2 == "f/*callee*/(/*sum*/x+y)"
 
     print()
-    print("=== 3. Rejection boundary that actually fires ===")
+    print("=== 3. Source map: output offsets back to AST nodes ===")
+    mapped_tree = binop("-", var("a"),
+                        binop("-", var("b"), var("c"), lead="inner"))
+    result = print_ast_mapped(mapped_tree)
+    print(f"- text: {result.text}")
+    for span in result.spans:
+        owned = result.text[span.start:span.end]
+        print(f"    {span.path:<12} [{span.start}:{span.end}] "
+              f"{owned!r:<18} parens={span.parens} slot={span.slot}")
+    offset = result.text.index("c")
+    hit = result.node_at(offset)
+    print(f"    offset {offset} ('c') resolves to node {hit.path!r}")
+    assert hit.path == "root.right.right"
+    assert result.span_for("root.right").parens == "added-structural"
+
+    print()
+    print("=== 4. Rejection boundary that actually fires ===")
     # 3a. Unrepresentable comment terminator in an AST.
     bad_ast = var("x", lead="oops */ */")
     try:
