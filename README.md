@@ -93,12 +93,50 @@ from minparen import ParseError, ASTError, BudgetExhaustedError, NoSolutionError
 - `print_ast(root) -> str`
   先做严格校验；任何结构/字段/注释违规抛 `ASTError`，带从根开始的定位路径
   （如 `root.right.args[1]`）。输入不会被修改。
+- `print_ast_mapped(root) -> FormatResult`
+  返回与 `print_ast` 逐字节相同的文本，外加每个节点的输出区间
+  （`FormatResult.nodes` / `span_for` / `node_at`）以及新增/省略括号的归属
+  理由（`FormatResult.parens`、`NodeSpan.paren_status`/`paren_reasons`）。
 - `validate_tree(root, *, max_nodes=300) -> dict`
   返回独立深拷贝；拒绝未知 `kind`、缺字段/多字段、错误类型、`bool` 数值、
   负数、非法标识符、共享/循环引用、超过 300 节点。
 
 错误都是“可定位、显式失败”，不做静默纠正；本库没有任何有状态/批处理式的
 部分提交操作，故不存在未说明的部分变更。
+
+### 输出位置与节点的对应（source map）
+
+除字符串外，还可以得到格式化输出中每个字符区间归属哪个 AST 节点：
+
+```python
+from minparen import print_ast_mapped
+
+result = print_ast_mapped(ast)          # 先严格校验，不修改输入
+result.text                             # 与 print_ast(ast) 逐字节相同
+result.nodes                            # 每个节点一条 NodeSpan（先序编号）
+result.parens                           # 每对“新增”括号的归属与理由
+result.node_at(offset)                  # 输出偏移 -> 最内层所属节点
+result.span_for("root.right.args[1]")  # 节点路径 -> 输出区间
+```
+
+- `NodeSpan` 字段：`node_id`（先序整数）、`path`（与 `ASTError` 一致的访问
+  路径，如 `root.right.args[1]`）、`kind`、`start`/`end`（半开区间，含该节点
+  新增的括号和绑定注释）、`core_start`/`core_end`（括号内侧区间）、`slot`
+  （所在父槽位，如 `bin+.right`）、`paren_status`、`paren_reasons`。
+- 节点身份是**树中的位置**而非内容：相同子表达式出现在不同位置时是不同节点，
+  有不同的 `node_id`、`path` 与区间，绝不合并。
+- 区间关系与表达式层次一致：子节点区间严格位于父节点 `core` 区间之内；
+  任意两个节点区间要么不相交，要么嵌套。运算符、`? : ,` 与调用括号字符归属
+  父节点；`node_at` 返回包含该位置的最内层节点。
+- 括号解释归属：
+  - `paren_status="added"`：该节点在输出中实际新增了一对括号，理由为
+    `"structural"`（槽位优先级要求）、`"comment-lead"` /
+    `"comment-trail"`（注释间隙被外层节点认领，必须自包一对），可同时出现；
+  - `paren_status="omitted"`：该槽位**可证明无需**括号，理由固定为
+    `"slot-tight"`（与最少括号规则一致的“省略”解释）；
+  - 调用 `f(...)` 的括号是固定语法而非新增括号，只体现在调用节点自身区间，
+    不出现在 `result.parens` 中。
+
 
 ### 输入上限
 
@@ -148,7 +186,7 @@ from minparen import ParseError, ASTError, BudgetExhaustedError, NoSolutionError
 ## 目录
 
 ```
-minparen/            # 本题库：ast_nodes, validation, printer, parser, errors
+minparen/            # 本题库：ast_nodes, validation, printer, sourcemap, parser, errors
 reference/           # 仅测试用：独立解析器 + 括号枚举最优参考（非核心）
 tests/test_minparen.py
 demo.py

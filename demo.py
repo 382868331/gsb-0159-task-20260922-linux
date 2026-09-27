@@ -20,6 +20,7 @@ import time
 
 from minparen import (
     ASTError, ParseError, parse, print_ast,
+    print_ast_mapped,
 )
 from minparen.ast_nodes import binop, call, cond, neg, num, var
 from reference import refenum
@@ -120,8 +121,33 @@ def main() -> None:
     assert text2 == "f/*callee*/(/*sum*/x+y)"
 
     print()
-    print("=== 3. Rejection boundary that actually fires ===")
-    # 3a. Unrepresentable comment terminator in an AST.
+    print()
+    print("=== 3. Output positions map back to AST nodes ===")
+    from minparen.ast_nodes import call as _call, var as _var
+    mapped_tree = binop("-", var("a"),
+                        binop("-", var("b"), var("c")))
+    result = print_ast_mapped(mapped_tree)
+    print(f"- formatted text: {result.text}")
+    for span in result.nodes:
+        fragment = result.text[span.start:span.end]
+        print(f"    [{span.start}:{span.end}] {span.path:18} "
+              f"parens={span.paren_status:7} reasons={span.paren_reasons} "
+              f"text={fragment!r}")
+    for pair in result.parens:
+        print(f"    pair at ({pair.open},{pair.close}) owned by "
+              f"{pair.node_path} because {pair.reasons}")
+    owner = result.node_at(2)
+    print(f"    node_at(offset 2, the added '(') -> {owner.path}")
+    dup = print_ast_mapped(_call(_var("f"), [_var("x"), _var("x")]))
+    print(f"    f(x,x): arg0 starts at {dup.span_for('root.args[0]').start}, "
+          f"arg1 starts at {dup.span_for('root.args[1]').start} "
+          "(identical text, distinct nodes)")
+    assert result.text == print_ast(mapped_tree)
+    assert owner.path == "root.right"
+
+    print()
+    print("=== 4. Rejection boundary that actually fires ===")
+    # 4a. Unrepresentable comment terminator in an AST.
     bad_ast = var("x", lead="oops */ */")
     try:
         print_ast(bad_ast)
@@ -130,7 +156,7 @@ def main() -> None:
     else:  # pragma: no cover
         raise SystemExit("expected ASTError was not raised")
 
-    # 3b. Comment in an empty argument list binds to no node.
+    # 4b. Comment in an empty argument list binds to no node.
     try:
         parse("f(/*orphan*/)")
     except ParseError as exc:
@@ -140,7 +166,7 @@ def main() -> None:
     else:  # pragma: no cover
         raise SystemExit("expected ParseError was not raised")
 
-    # 3c. Budget exhaustion vs. proven impossibility, on the reference.
+    # 4c. Budget exhaustion vs. proven impossibility, on the reference.
     from minparen import BudgetExhaustedError, NoSolutionError
     sample_tree = refenum.ref_parse("a-(b-c)-(x-y)")
     try:
